@@ -7,7 +7,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 max_iters = 5000
 eval_interval = 500
 eval_iters = 200
-lr = 3e-4
+lrate = 3e-4
 n_embbed = 384
 block_s = 128
 batch_s = 64
@@ -49,29 +49,19 @@ def encode(in_str):
 def decode(in_int_list):
     return ''.join([itos[x] for x in in_int_list])
 
-train_split_n = 0.8 # 80% of the dataset used in training.
+train_split_n = 0.9 # 90% of the dataset used in training.
 val_split_n = 0.1 # 10% of the dataset used in validation.
-test_split_n = 0.1 # 10% of the dataset used in testing.
 
 # encode text (data set) -> data
 data = torch.tensor(encode(text), dtype=torch.long)
-
-train_split = data[: int(train_split_n * len(data))]
-val_split = data[int(train_split_n * len(data)) : int(-val_split_n * len(data))]
-test_split = data[: int(test_split_n * len(data))]
-
-len(train_split), len(val_split), len(test_split)
+n = int(train_split_n * len(data))
+train_split = data[: n]
+val_split = data[n :]
 
 # make a func to take in data in splits and return Xs and Ys
 def build_batch(split):
     #determine split type and use relevant set
-    match split:
-        case 'train':
-            dta = train_split
-        case 'val':
-            dta = val_split
-        case 'test':
-            dta = test_split
+    dta = train_split if split == 'train' else val_split
     # sample block size examples at random from set
     ix = torch.randint(0, len(dta) - block_s, (batch_s, ))
     xs = torch.stack([dta[i : i + block_s] for i in ix])
@@ -86,12 +76,11 @@ xs, ys = build_batch('train')
 def get_loss():
     out = {}
     model.eval()
-    splits = ['train', 'val']
-    for split in splits:
+    for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             x, y = build_batch(split)
-            _ , loss = model(x, y)
+            logits , loss = model(x, y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -155,8 +144,7 @@ class FeedForward(torch.nn.Module):
         )
 
     def forward(self, x):
-        out = self.net(x)
-        return out
+        return self.net(x)
 
 class Block(torch.nn.Module):
     def __init__(self, n_embbed, n_heads):
@@ -164,7 +152,7 @@ class Block(torch.nn.Module):
         
         #initalize both multihead and ffwds
         head_s = n_embbed // n_heads
-        self.mh = MultiheadAttention(n_heads, size=head_s)
+        self.mh = MultiheadAttention(n_heads, head_s)
         self.ffwd = FeedForward(n_embbed)
         self.attention_layer_norm = torch.nn.LayerNorm(n_embbed)
         self.ffwd_layer_norm = torch.nn.LayerNorm(n_embbed)
@@ -207,7 +195,7 @@ class LanguageModel(torch.nn.Module):
         x = self.ln_f(x)
         logits = self.lm_head(x) # (B, T, C) 
         
-        # during generation targets, loss are not req
+        # during generation targets, loss is not req
         if targets is None:
             loss = None
         else:
@@ -226,23 +214,20 @@ class LanguageModel(torch.nn.Module):
             logits, _ = self(context) # (B, T, C) (b, t) (b, t, C)
             logits = logits[:, -1, :] # (b, C)
             #softmax logits to get probabilities 
-            probs = torch.nn.functional.softmax(logits, dim=1) # (b, C)
+            probs = torch.nn.functional.softmax(logits, dim=-1) # (b, C)
             #use probs to sample from multinomial and append to the idx
-            x = torch.multinomial(probs, num_samples=1) # (b, 1)
-            idx = torch.cat((idx, x), dim=1)  # # (b, C + 1)
+            idx_next = torch.multinomial(probs, num_samples=1) # (b, 1)
+            idx = torch.cat((idx, idx_next), dim=1)  # # (b, C + 1)
         return idx
     
 model = LanguageModel()
 m = model.to(device)
-logits, loss = model(xs, ys)
-print(logits.shape)
-print(loss)
 
-# print the number of parameters in the model
-print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
+# log the number of parameters in the model
+print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 #setup optimizer
-optim = torch.optim.AdamW(model.parameters(), lr=lr)
+optimizer = torch.optim.AdamW(model.parameters(), lr=lrate)
 
 
 for iter in range(max_iters):
@@ -259,11 +244,11 @@ for iter in range(max_iters):
     logits, loss = model(x, y)
     
     #backward
-    optim.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)
     loss.backward()
     
     #optimize
-    optim.step()
+    optimizer.step()
     
 print(loss)
 

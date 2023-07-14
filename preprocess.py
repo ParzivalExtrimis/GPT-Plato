@@ -17,3 +17,8 @@ for pdf_path in pdf_files:
 
 with open(r"C:\Users\aryan\Downloads\plato-gpt\datasets\sam_harris_podcast_transcripts/data.txt", "w") as f:
     f.write(text)
+
+with open(r"C:\Users\aryan\Downloads\plato-gpt\datasets\sam_harris_podcast_transcripts/data.txt", "r") as f:
+    text = f.read()
+
+print(text[:20])

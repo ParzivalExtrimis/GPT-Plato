@@ -1,15 +1,18 @@
 from PyPDF2 import PdfReader
 import os
 import glob
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import joblib
+from azureml.core import Run
 
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 128 # what is the maximum context length for predictions?
-max_iters = 5000
-eval_interval = 500
+max_iters = 500
+eval_interval = 50
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
@@ -21,19 +24,19 @@ dropout = 0.2
 
 torch.manual_seed(1337)
 
-directory_path = 'datasets\sam_harris_podcast_transcripts'
+# Get the experiment run context
+def get_azure_ctx():
+    try:
+        run = Run.get_context()
+        return run
+    except Exception as e:
+        print('AzureML Context could not be loaded: ', e)
+        return None
 
-pdf_files = glob.glob(os.path.join(directory_path, '*.pdf')) # get all dataset chunks
+run = get_azure_ctx()
 
-#get the total size of dataset
-text = ''
-for pdf_path in pdf_files:
-    reader = PdfReader(pdf_path)
-    pages = reader.pages
-
-    # extracting text from page
-    for page in pages:
-        text += page.extract_text()
+with open('experiments\gpt\data.txt', 'r', encoding='latin-1') as f:
+    text = f.read()
 
 # here are all the unique characters that occur in this text
 chars = sorted(list(set(text)))
@@ -222,6 +225,9 @@ for iter in range(max_iters):
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if run is not None:
+            run.log("Training Loss", losses['train'])
+            run.log("Validation Loss", losses['val'])
 
     # sample a batch of data
     xb, yb = get_batch('train')
@@ -231,6 +237,12 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+
+# Save the trained model
+os.makedirs('outputs', exist_ok=True)
+joblib.dump(value=model, filename='outputs/model.pkl')
+
+run.complete()
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
