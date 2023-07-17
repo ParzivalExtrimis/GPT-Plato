@@ -1,30 +1,29 @@
 import os
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import mlflow
+from azure.ai.ml import MLClient
+from azure.identity import DefaultAzureCredential
+from azure.ai.ml.entities import Data
+from azure.ai.ml.constants import AssetTypes
 from azureml.core import Run
 
+def upload_to_datastore(filepath, name, description=''):
+    credential = DefaultAzureCredential()
+    client = MLClient.from_config(credential)
+    my_data = Data(
+        name=name,
+        description=description,
+        path=filepath,
+        type=AssetTypes.URI_FILE,
+    )
+    client.data.create_or_update(my_data)
+    print(f"Data asset created. Name: {my_data.name}, version: {my_data.version}")
 
-def main():
-    # input and output arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, help="path to input data")
-    parser.add_argument("--batch_size", type=int, default=96, required=False, help="")
-    parser.add_argument("--block_size", type=int, default=256, required=False, help="")
-    parser.add_argument("--epochs", type=int, default=5000, required=False, help="")
-    parser.add_argument("--eval_interval", type=int, default=100, required=False, help="")
-    parser.add_argument("--eval_iters", type=int, default=200, required=False, help="")
-    parser.add_argument("--n_embbed", type=int, default=384, required=False, help="")
-    parser.add_argument("--n_heads", type=int, default=6, required=False, help="")
-    parser.add_argument("--n_layers", type=int, default=6, required=False, help="")
-    parser.add_argument("--dropout", type=float, default=0.2, required=False, help="")
-    parser.add_argument("--test_train_ratio",type=float, required=False, default=0.9, help="Specify the ratio (0.9) for the train split")
-    parser.add_argument("--learning_rate", required=False, default=3e-4, type=float)
-    parser.add_argument("--registered_model_name", type=str, help="model name")
-    args = parser.parse_args()
-   
+def main(args):
     # Start Logging
     run = Run.get_context()
     run_id = run._run_id
@@ -33,12 +32,15 @@ def main():
     else:
         mlflow.start_run()
 
+    mlflow.autolog()
+
     # hyperparameters
     batch_size = args.batch_size # independent sequences to process in parallel?
     block_size = args.block_size # maximum context length for predictions
     test_train_split_ratio = args.test_train_ratio
     max_iters = args.epochs
     eval_interval = args.eval_interval
+    save_interval = args.save_interval
     learning_rate = args.learning_rate
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     eval_iters = args.eval_iters
@@ -48,14 +50,10 @@ def main():
     dropout = args.dropout
     # ------------
 
-
     torch.manual_seed(1337)
 
     with open(args.data, 'r', encoding='latin-1') as f:
         text = f.read()
-
-    log_f = os.makedirs('outputs/logs', exist_ok=True)
-    mlflow.log_text(f'Text retrieved from datastore: {text[:40]}', log_f)
 
     # here are all the unique characters that occur in this text
     chars = sorted(list(set(text)))
@@ -72,8 +70,8 @@ def main():
     train_data = data[:n]
     val_data = data[n:]
 
-    mlflow.log_metric("Number of tokens:", vocab_size)
-    mlflow.log_metric("Dataset size: ", data.shape)
+    mlflow.log_metric("Number of tokens:", np.float32(vocab_size))
+    mlflow.log_metric("Dataset size: ", np.float32(data.view(-1).shape).item())
 
     # data loading
     def get_batch(split):
@@ -96,8 +94,6 @@ def main():
                 logits, loss = model(X, Y)
                 losses[k] = loss.item()
             out[split] = losses.mean()
-            mlflow.log_metric('Training Loss', float(out['train']))
-            mlflow.log_metric('Validation Loss', float(out['val']))
         model.train()
         return out
 
@@ -240,7 +236,14 @@ def main():
     # print the number of parameters in the model
     print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
+    ##########################
+            #<Training>
+    ##########################
+
     # create a PyTorch optimizer
+    checkpoints = os.path.join('checkpoints')
+    filepath = os.path.join(checkpoints, run.experiment.name, run._run_name)
+    os.makedirs(checkpoints+run.experiment.name+run._run_name, exist_ok=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     for iter in range(max_iters):
@@ -249,6 +252,21 @@ def main():
         if iter % eval_interval == 0 or iter == max_iters - 1:
             losses = estimate_loss()
             print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            mlflow.log_metric('Training Loss', np.float32(losses['train']))
+            mlflow.log_metric('Validation Loss', np.float32(losses['val']))
+
+        if iter % save_interval == 0 or iter == max_iters - 1:
+            state = {
+                'epoch': iter,
+                'state_dict': m.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }
+            torch.save(state, filepath)
+            upload_to_datastore(
+                filepath = filepath,
+                name = 'checkpoint',
+                description = 'Checkpoint for torch.save() last commit.',
+            )
 
         # sample a batch of data
         xb, yb = get_batch('train')
@@ -259,28 +277,39 @@ def main():
         loss.backward()
         optimizer.step()
 
+    ##########################
+            #<Training>
+    ##########################
+
     # generate from the model
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
     print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-    open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+
+    generated_out_dir = os.path.join('outputs','generated_out')
+    os.makedirs(generated_out_dir, exist_ok=True)
+    open(args.out, 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+    upload_to_datastore(
+        filepath = filepath,
+        name = 'model_generated_output',
+        description = 'Text sample generated my model after training',
+    )
 
     ##########################
     #<save and register model>
     ##########################
+
     # Registering the model to the workspace
     print("Registering the model via MLFlow")
     mlflow.pytorch.log_model(
-        pytorch_model=model,
+        pytorch_model=m,
         registered_model_name=args.registered_model_name,
-        artifact_path=os.path('outputs', args.registered_model_name),
+        artifact_path=args.registered_model_name,
     )
 
     # Saving the model to a file
-    model_save_path = os.path('outputs', run.experiment.name)
-    os.makedirs(model_save_path, exist_ok=True)
     mlflow.pytorch.save_model(
-        pytorch_model=model,
-        path=model_save_path,
+        pytorch_model=m,
+        path=os.path.join(args.registered_model_name, "trained_model"),
     )
     ###########################
     #</save and register model>
@@ -288,3 +317,32 @@ def main():
 
     # Stop Logging
     mlflow.end_run()
+    run.complete()
+
+def parse_args():
+     # input and output arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, help="path to input data")
+    parser.add_argument("--batch_size", type=int, default=96, required=False, help="")
+    parser.add_argument("--block_size", type=int, default=256, required=False, help="")
+    parser.add_argument("--epochs", type=int, default=5000, required=False, help="")
+    parser.add_argument("--eval_interval", type=int, default=100, required=False, help="")
+    parser.add_argument("--save_interval", type=int, default=1000, required=False, help="")
+    parser.add_argument("--eval_iters", type=int, default=200, required=False, help="")
+    parser.add_argument("--n_embbed", type=int, default=384, required=False, help="")
+    parser.add_argument("--n_heads", type=int, default=6, required=False, help="")
+    parser.add_argument("--n_layers", type=int, default=6, required=False, help="")
+    parser.add_argument("--dropout", type=float, default=0.2, required=False, help="")
+    parser.add_argument("--test_train_ratio",type=float, required=False, default=0.9, help="Specify the ratio (0.9) for the train split")
+    parser.add_argument("--learning_rate", required=False, default=3e-4, type=float)
+    parser.add_argument("--registered_model_name", type=str, help="model name")
+    parser.add_argument("--out", type=str, help="output file reference")
+    
+    args = parser.parse_args()
+    return args
+
+# run script
+if __name__ == "__main__":
+    # parse args
+    args = parse_args()
+    main(args)

@@ -25,16 +25,16 @@ input_data = dataset.as_named_input('data').as_mount('/tmp/{}'.format(uuid4()))
 
 decorator = '\n=============================================================================================================================================\n'
 #make scrpit config
-prefix = git.Repo('.', search_parent_directories=True).working_tree_dir
-
-if prefix is None:
-    print('Git repo could not be initialized.')
+try:
+    prefix = git.Repo('.', search_parent_directories=True).working_tree_dir
+except:
+    raise Exception('Git repo could not be initialized.')
 
 
 gpu_compute_target = "gpu-compute"
 registered_model_name = "plato-gpt-cuda-trained_model"
 environment_name = "AzureML-ACPT-pytorch-1.12-py39-cuda11.6-gpu"
-train_src_dir = prefix + '/experiments/gpt/src/'
+train_src_dir = prefix + '/src/'
 os.makedirs(train_src_dir, exist_ok=True)
 
 print(decorator, 'Input dataset: \n', input_data, decorator)
